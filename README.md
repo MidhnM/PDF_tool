@@ -1,4 +1,6 @@
-# PDF Desk - Python desktop PDF editor
+# PDF Editor Tool — Version 1.0
+
+Creator: **Midhun M**
 
 A local desktop application built with PySide6 and PyMuPDF. Open the folder in PyCharm and run `main.py`.
 
@@ -26,13 +28,28 @@ No API keys, server, account, or Internet connection are needed after dependency
 
 - **Open PDF**: opens a working copy. Password-protected documents prompt for a password.
 - Choose **All pages**, **Current page**, or **Page range**. Page ranges use 1-based numbers: `1-3,5,8-10`.
-- Drag a rectangle on the page. Outside the rectangle is shaded and the crop preview updates during dragging. Draw again to replace the rectangle. Change pages or zoom to review the same selection.
+- Drag a rectangle on the page. In Crop mode, the outside of the rectangle is shaded directly on the main page. Drag any of the eight handles or an edge to resize; drag inside to move. Draw outside the selection or Shift+drag anywhere to replace it. There is no separate mini-preview. Change pages or zoom to review the same selection.
 - **Apply crop** keeps the selected visible rectangle across the chosen pages. This is an editable crop, not content destruction; use redaction to remove confidential content.
 - **Redact selected area** removes content under the rectangle, with white or black fill. This works on the current page, selected ranges, or all pages. Save a new copy and inspect it before sharing.
-- **Add text** puts text in the selected rectangle on the chosen pages. Use `{page}` for the actual document page number and `{pages}` for the total. Text runs horizontally as viewed, including rotated pages. Text is left aligned using Helvetica; this version supports Latin characters. If the text cannot fit, the entire operation is rejected: enlarge the rectangle or reduce the font size.
-- **Save copy** writes a full, compressed PDF to a separate filename. It does not overwrite the originally opened file.
+- **Add text** puts text in the selected rectangle on the chosen pages. Use `{page}` for the actual document page number and `{pages}` for the total. Text runs horizontally as viewed, including rotated pages. Text is left aligned using Helvetica; this version supports Latin characters. Text previews directly on the main page using the same PDF layout code as saving. Auto-fit is enabled by default: text wraps and shrinks down to 4 pt if needed, and grows back toward the configured maximum as the box expands. Uncheck Auto-fit to retain a fixed font size. If text still cannot fit, the operation is rejected without changing the document.
+- **Save copy** opens a preview dialog with **All pages**, **Current page**, or **Page range**. Browse the output pages before saving to a separate filename. The same dialog appears after each successful document edit; choose **Keep editing** to defer saving. Exports and splits already write their selected outputs, so they retain their existing completion message. Saving only a subset keeps the remaining document changes marked unsaved. The originally opened file cannot be overwritten.
 
-Selection coordinates are proportional to the currently visible page, not fixed millimetre offsets. For example, selecting the top 10% on an A4 page selects the top 10% on an A3 page. The same box remains selected while browsing pages; it is cleared after an edit. This also handles mixed page rotations and existing crop boxes.
+Selection coordinates are proportional to the currently visible page, not fixed millimetre offsets. For example, selecting the top 10% on an A4 page selects the top 10% on an A3 page. The same box remains selected while browsing pages; it is cleared after an edit. The **Preview tool** selector switches between Crop, Redaction, Text, Highlight, and Comment; editing a text/comment control selects its preview mode automatically. A preview does not modify the PDF until you press its Add/Apply button. This also handles mixed page rotations and existing crop boxes.
+
+## Highlights and comments
+
+Use the **Text & comments** tabs next to the existing text tool:
+
+- **Highlight**: draw around text and choose yellow, green, blue, pink, or orange. The preview follows actual text characters. You can add a comment to the highlight. For image-only scans, select **Area highlight**; it creates a transparent colored rectangle annotation.
+- **Comment**: enter a note and draw a box; the comment marker is placed at the upper-left of the selected area. Use **View comments on current page** to read saved notes in the app. PDF readers supporting annotations can also display them.
+- Both tools use the same current/all/range page scope. Text highlight requires selectable text in the rectangle on every target page; if one has none, the whole edit is rejected. Use Area highlight for scans or a narrower page range.
+- Highlights and comments remain annotations; redaction remains the distinct content-removal operation.
+
+## Branding and Windows icon
+
+The About button shows **PDF Editor Tool**, **Version 1.0**, and **Creator: Midhun M**. A faint creator watermark appears only in the app footer; it is not added to your PDFs.
+
+Keep the `assets` folder beside `main.py`. The application loads a multi-resolution `.ico` for its window icon. The Windows entry point also assigns an AppUserModelID to show the icon as a separate application on the taskbar when run normally from PyCharm. Taskbar pin/shortcut icon caching is controlled by Windows; an already pinned Python shortcut may retain its old icon. Unpin that shortcut and run `main.py` again. Native Windows taskbar behaviour was not testable in the Linux verification environment.
 
 ## More tools
 
@@ -73,11 +90,14 @@ This is region-based redaction, not a complete forensic sanitization tool. Data 
 
 ## Project files
 
-- `main.py`: desktop UI, live selection, background jobs, history, file dialogs.
+- `main.py`: desktop UI, live overlay previews, background jobs, history, branding, file dialogs.
+- `widgets.py`: movable/resizable selection canvas and output-scope preview dialog.
+- `assets/`: application icon in ICO, PNG, and editable SVG formats.
 - `engine.py`: page parsing, crop/text/redaction transformations, merging, extraction, atomic saves.
 - `tests/`: PDF-content and GUI interaction tests.
 - `requirements.txt`: exact dependency versions used for verification.
 - `preview.png`: example application screenshot.
+- `save_preview.png`: save-scope dialog screenshot.
 
 Run the checks from the project folder:
 
@@ -85,6 +105,6 @@ Run the checks from the project folder:
 python -m unittest discover -s tests -v
 ```
 
-The suite checks a 301-page crop, rotation and crop offsets, text placement, real text/image redaction, merge/extraction/reordering/deletion, password encryption, error rollback, live selection, background edits, and undo/redo.
+The 16-test suite checks selection resizing/moving, preview/export layout matching, highlights/comments, output scope and unsaved state, plus a 301-page crop, rotation and crop offsets, text placement, real text/image redaction, merge/extraction/reordering/deletion, password encryption, error rollback, live selection, background edits, and undo/redo.
 
 Technical references: [PyMuPDF page operations](https://pymupdf.readthedocs.io/en/latest/page.html), [PySide6](https://doc.qt.io/qtforpython-6/). Third-party dependencies retain their own licenses; see [PyMuPDF licensing](https://pymupdf.readthedocs.io/en/latest/about.html#license-and-copyright) and [Qt for Python licensing](https://doc.qt.io/qtforpython-6/licenses.html) before distributing an application.

@@ -91,20 +91,8 @@ def edit(source, target, operation, indices, selection=None, progress=None, **op
                     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS,
                         graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
                         text=fitz.PDF_REDACT_TEXT_REMOVE)
-                elif operation == 'text':
-                    vr = visible_rect(page, selection)
-                    padding = options['size'] * 0.2
-                    vr += (padding, padding, -padding, -padding)
-                    if vr.is_empty:
-                        raise ValueError('Text box is too small.')
-                    r = vr * page.derotation_matrix
-                    text = options['text'].replace('{page}', str(index+1)).replace('{pages}', str(len(doc)))
-                    if any(ord(c) > 255 for c in text):
-                        raise ValueError('Built-in font supports Latin text. Use Latin characters for this version.')
-                    remaining = page.insert_textbox(r, text, fontsize=options['size'],
-                        fontname='helv', color=options.get('color', (0, 0, 0)), rotate=page.rotation)
-                    if remaining < 0:
-                        raise ValueError(f'Text does not fit on page {index+1}. Draw a larger box or reduce font size.')
+                elif operation in ('text', 'highlight', 'comment'):
+                    apply_overlay(page, operation, selection, index+1, len(doc), **options)
                 elif operation == 'rotate':
                     page.set_rotation((page.rotation + options.get('angle', 90)) % 360)
                 elif operation == 'reset_crop':
@@ -127,3 +115,72 @@ def extract(source, target, indices):
     with fitz.open(source) as doc:
         doc.select(indices)
         atomic_save(doc, target)
+
+
+def apply_overlay(page, operation, selection, page_number, page_count, **options):
+    """Shared by preview and export: identical PDF layout rather than a Qt approximation."""
+    r = content_rect(page, selection)
+    if operation == 'text':
+        text = options['text'].replace('{page}', str(page_number)).replace('{pages}', str(page_count))
+        if any(ord(c) > 255 for c in text):
+            raise ValueError('Built-in font supports Latin text. Use Latin characters for this version.')
+        if not text.strip():
+            raise ValueError('Enter text to preview.')
+        requested = float(options['size'])
+        sizes = [requested]
+        if options.get('autofit', False):
+            sizes.extend(v/2 for v in range(int(requested*2)-1, 7, -1))
+        for size in sizes:
+            vr = visible_rect(page, selection)
+            padding = size * .2
+            vr += (padding, padding, -padding, -padding)
+            if vr.is_empty:
+                continue
+            shape = page.new_shape()
+            remaining = shape.insert_textbox(vr * page.derotation_matrix, text,
+                fontsize=size, fontname='helv', color=options.get('color',(0,0,0)),
+                rotate=page.rotation)
+            if remaining >= 0:
+                shape.commit()
+                return f'Text preview · {size:g} pt'
+        raise ValueError(f'Text does not fit on page {page_number}. Enlarge the box or reduce text.')
+    color = options.get('color',(1, .84, 0))
+    note = options.get('note','')
+    if operation == 'highlight':
+        if options.get('area_highlight',False):
+            annot=page.add_rect_annot(r)
+            annot.set_colors(stroke=color,fill=color)
+            annot.set_border(width=0)
+        else:
+            # Recover character quads so angled text is highlighted in its own direction.
+            quads=[]
+            for block in page.get_text('rawdict')['blocks']:
+                for line in block.get('lines',[]):
+                    for span in line['spans']:
+                        run=[]
+                        for char in span['chars']:
+                            if r.intersects(fitz.Rect(char['bbox'])):
+                                run.append(char)
+                            elif run:
+                                quads.append(fitz.recover_span_quad(line['dir'],span,chars=run))
+                                run=[]
+                        if run:
+                            quads.append(fitz.recover_span_quad(line['dir'],span,chars=run))
+            if not quads:
+                raise ValueError(f'No selectable text on page {page_number}. Choose Area highlight for scans.')
+            annot=page.add_highlight_annot(quads)
+            annot.set_colors(stroke=color)
+        annot.set_opacity(.35)
+        annot.set_info(title='Midhun M',content=note)
+        annot.update()
+        return 'Highlight preview'
+    if operation == 'comment':
+        if not note.strip():
+            raise ValueError('Enter a comment first.')
+        point = visible_rect(page,selection).tl * page.derotation_matrix
+        annot=page.add_text_annot(point,note,icon='Comment')
+        annot.set_colors(stroke=color)
+        annot.set_info(title='Midhun M',content=note)
+        annot.update()
+        return 'Comment preview · note appears as a PDF comment icon'
+    raise ValueError('Unknown overlay type.')

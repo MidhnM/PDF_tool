@@ -5,71 +5,14 @@ import tempfile
 import uuid
 from pathlib import Path
 import pymupdf as fitz
-from PySide6.QtCore import Qt, QRectF, Signal, QThread
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QAction
+from PySide6.QtCore import Qt, QRectF, Signal, QThread, QTimer
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QAction, QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QFileDialog, QMessageBox, QComboBox,
     QLineEdit, QSpinBox, QDoubleSpinBox, QScrollArea, QSplitter, QFormLayout,
-    QGroupBox, QTextEdit, QInputDialog, QProgressBar, QCheckBox)
-from engine import edit, extract, atomic_save, pages_from_text
-
-
-class Canvas(QWidget):
-    selected = Signal(object)
-
-    def __init__(self):
-        super().__init__()
-        self.pix = QPixmap()
-        self.selection = None
-        self.anchor = None
-        self.setCursor(Qt.CrossCursor)
-        self.setMinimumSize(400, 500)
-
-    def set_page(self, pix):
-        self.pix = pix
-        self.setFixedSize(pix.size())
-        self.update()
-
-    def fraction(self, p):
-        return (max(0., min(1., p.x()/self.width())),
-                max(0., min(1., p.y()/self.height())))
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.pix.isNull():
-            self.anchor = self.fraction(event.position())
-            self.selection = None
-
-    def mouseMoveEvent(self, event):
-        if self.anchor is not None:
-            x, y = self.fraction(event.position())
-            a, b = self.anchor
-            self.selection = (min(a,x), min(b,y), max(a,x), max(b,y))
-            self.update()
-            self.selected.emit(self.selection)
-
-    def mouseReleaseEvent(self, event):
-        if self.anchor is not None:
-            self.mouseMoveEvent(event)
-            self.anchor = None
-            if self.selection and (self.selection[2]-self.selection[0] < .003 or self.selection[3]-self.selection[1] < .003):
-                self.selection = None
-            self.selected.emit(self.selection)
-            self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor('white'))
-        p.drawPixmap(0, 0, self.pix)
-        if self.selection:
-            x0,y0,x1,y1 = self.selection
-            r = QRectF(x0*self.width(), y0*self.height(), (x1-x0)*self.width(), (y1-y0)*self.height())
-            shade = QColor(16, 24, 40, 125)
-            p.fillRect(QRectF(0,0,self.width(),r.top()), shade)
-            p.fillRect(QRectF(0,r.bottom(),self.width(),self.height()-r.bottom()), shade)
-            p.fillRect(QRectF(0,r.top(),r.left(),r.height()), shade)
-            p.fillRect(QRectF(r.right(),r.top(),self.width()-r.right(),r.height()), shade)
-            p.setPen(QPen(QColor('#2563eb'), 2))
-            p.drawRect(r)
+    QGroupBox, QTextEdit, QInputDialog, QProgressBar, QCheckBox, QTabWidget, QDialog, QFrame)
+from engine import edit, extract, atomic_save, pages_from_text, apply_overlay
+from widgets import Canvas, SavePreviewDialog, page_pixmap
 
 
 class Worker(QThread):
@@ -100,7 +43,13 @@ class Editor(QMainWindow):
         self.future = []
         self.dirty = False
         self.worker = None
-        self.setWindowTitle('PDF Desk | Crop • Organize • Redact')
+        self.pending_save_prompt = False
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(100)
+        self.preview_timer.timeout.connect(lambda: self.safe(self.render))
+        self.setWindowTitle('PDF Editor Tool | Version 1.0')
+        self.setWindowIcon(QIcon(str(Path(__file__).parent / 'assets' / 'app.ico')))
         self.resize(1280, 850)
         self.build_ui()
 
@@ -125,6 +74,7 @@ class Editor(QMainWindow):
         for title, fn in [('Open PDF', self.open_pdf), ('Save copy', self.save_pdf),
                           ('Undo', self.undo), ('Redo', self.redo), ('Append PDFs', self.merge)]:
             self.button(title, fn, bar)
+        self.button('About', self.about, bar)
         bar.addStretch()
         self.filename = QLabel('Open a PDF to begin')
         bar.addWidget(self.filename)
@@ -134,7 +84,7 @@ class Editor(QMainWindow):
         left.setMinimumWidth(300)
         left.setMaximumWidth(390)
         panel = QVBoxLayout(left)
-        intro = QLabel('PDF DESK\nDraw once. Apply across pages.')
+        intro = QLabel('PDF Editor Tool\nSelect · Edit · Save')
         intro.setStyleSheet('font-size:18px; font-weight:600; padding:10px 0;')
         panel.addWidget(intro)
         form = QFormLayout()
@@ -145,35 +95,73 @@ class Editor(QMainWindow):
         form.addRow('Apply to', self.scope)
         form.addRow('Page range', self.ranges)
         panel.addLayout(form)
-        hint = QLabel('Drag a box on the page. The same relative area is used on differently sized pages. Change page to inspect before applying.')
+        self.mode = QComboBox()
+        self.mode.addItems(['Crop', 'Redaction', 'Text', 'Highlight', 'Comment'])
+        form.addRow('Preview tool', self.mode)
+        hint = QLabel('Drag corners or edges to resize; drag inside to move. Shift+drag draws a new box. Preview the same relative area on any page.')
         hint.setWordWrap(True)
         panel.addWidget(hint)
         self.measure = QLabel('No area selected')
         panel.addWidget(self.measure)
-        self.preview = QLabel('Live crop preview')
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setFixedHeight(145)
-        self.preview.setStyleSheet('background:#e2e8f0; border:1px solid #cbd5e1;')
-        panel.addWidget(self.preview)
-        self.button('Apply crop', lambda: self.mutate('crop', area=True), panel)
-        self.black = QCheckBox('Black redaction fill (otherwise white)')
-        panel.addWidget(self.black)
-        self.button('Redact selected area — remove content', self.redact, panel)
-        text_box = QGroupBox('Text / page numbers in selected box')
-        tf = QVBoxLayout(text_box)
+        crop = QGroupBox('Crop')
+        crop_layout = QVBoxLayout(crop)
+        self.button('Apply crop', lambda: self.mutate('crop', area=True), crop_layout)
+        panel.addWidget(crop)
+        redact = QGroupBox('Redaction · removes content')
+        redact_layout = QVBoxLayout(redact)
+        self.black = QCheckBox('Black fill (otherwise white)')
+        redact_layout.addWidget(self.black)
+        self.button('Redact selected area', self.redact, redact_layout)
+        panel.addWidget(redact)
+        annotations = QGroupBox('Text && comments')
+        annotation_layout = QVBoxLayout(annotations)
+        self.tabs = QTabWidget()
+        annotation_layout.addWidget(self.tabs)
+        text_page = QWidget()
+        tf = QVBoxLayout(text_page)
         self.text = QTextEdit('Page {page} of {pages}')
         self.text.setFixedHeight(70)
         tf.addWidget(self.text)
         self.font_size = QSpinBox()
-        self.font_size.setRange(6, 144)
+        self.font_size.setRange(6,144)
         self.font_size.setValue(12)
         size_row = QHBoxLayout()
-        size_row.addWidget(QLabel('Font size (pt)'))
+        size_row.addWidget(QLabel('Maximum size (pt)'))
         size_row.addWidget(self.font_size)
         tf.addLayout(size_row)
-        self.button('Add text', lambda: self.mutate('text', area=True,
-            text=self.text.toPlainText(), size=self.font_size.value()), tf)
-        panel.addWidget(text_box)
+        self.autofit = QCheckBox('Auto-fit text when box changes')
+        self.autofit.setChecked(True)
+        tf.addWidget(self.autofit)
+        self.button('Add text',lambda: self.mutate('text',area=True,**self.overlay_options('text')),tf)
+        self.tabs.addTab(text_page,'Text')
+        highlight_page = QWidget()
+        hl = QVBoxLayout(highlight_page)
+        self.highlight_color = QComboBox()
+        for name,color in [('Yellow',(1,.84,0)),('Green',(.2,.85,.4)),('Blue',(.25,.65,1)),
+                           ('Pink',(1,.35,.65)),('Orange',(1,.6,.1))]:
+            self.highlight_color.addItem(name,color)
+        hl.addWidget(self.highlight_color)
+        self.highlight_area = QCheckBox('Area highlight (for scans / images)')
+        hl.addWidget(self.highlight_area)
+        self.highlight_note = QTextEdit()
+        self.highlight_note.setPlaceholderText('Optional comment attached to highlight')
+        self.highlight_note.setFixedHeight(65)
+        hl.addWidget(self.highlight_note)
+        self.button('Add highlight',lambda: self.mutate('highlight',area=True,**self.overlay_options('highlight')),hl)
+        self.tabs.addTab(highlight_page,'Highlight')
+        comment_page = QWidget()
+        cl = QVBoxLayout(comment_page)
+        self.comment = QTextEdit()
+        self.comment.setPlaceholderText('Add a sticky-note comment to this location')
+        self.comment.setFixedHeight(85)
+        cl.addWidget(self.comment)
+        self.button('Add comment',lambda: self.mutate('comment',area=True,**self.overlay_options('comment')),cl)
+        self.button('View comments on current page', self.view_comments, cl)
+        self.tabs.addTab(comment_page,'Comment')
+        panel.addWidget(annotations)
+        self.overlay_status = QLabel('')
+        self.overlay_status.setWordWrap(True)
+        panel.addWidget(self.overlay_status)
         tools = QComboBox()
         tools.addItems(['Choose another tool…', 'Extract selected pages', 'Split by page groups',
             'Rotate selected pages 90°', 'Delete selected pages', 'Reorder / duplicate pages',
@@ -184,7 +172,13 @@ class Editor(QMainWindow):
         panel.addWidget(tools)
         self.button('Clear selection', self.clear_selection, panel)
         panel.addStretch()
-        splitter.addWidget(left)
+        sidebar = QScrollArea()
+        sidebar.setWidgetResizable(True)
+        sidebar.setMinimumWidth(335)
+        sidebar.setMaximumWidth(415)
+        sidebar.setFrameShape(QFrame.NoFrame)
+        sidebar.setWidget(left)
+        splitter.addWidget(sidebar)
         right = QWidget()
         rv = QVBoxLayout(right)
         nav = QHBoxLayout()
@@ -217,12 +211,28 @@ class Editor(QMainWindow):
         self.progress.setVisible(False)
         outer.addWidget(self.progress)
         self.statusBar().showMessage('Files stay on your computer. Original PDFs remain unchanged.')
+        watermark = QLabel('Created by Midhun M')
+        watermark.setStyleSheet('color:rgba(50,65,85,65);font-size:12px;padding:4px 12px;')
+        self.statusBar().addPermanentWidget(watermark)
+        self.mode.currentTextChanged.connect(self.mode_changed)
+        self.tabs.currentChanged.connect(lambda i: self.mode.setCurrentText(['Text','Highlight','Comment'][i]))
+        self.text.textChanged.connect(lambda: self.activate_overlay('Text'))
+        self.font_size.valueChanged.connect(lambda: self.activate_overlay('Text'))
+        self.autofit.toggled.connect(lambda: self.activate_overlay('Text'))
+        self.highlight_color.currentIndexChanged.connect(lambda: self.activate_overlay('Highlight'))
+        self.highlight_area.toggled.connect(lambda: self.activate_overlay('Highlight'))
+        self.highlight_note.textChanged.connect(lambda: self.activate_overlay('Highlight'))
+        self.comment.textChanged.connect(lambda: self.activate_overlay('Comment'))
         for shortcut, fn in [('Ctrl+O',self.open_pdf), ('Ctrl+S',self.save_pdf), ('Ctrl+Z',self.undo), ('Ctrl+Y',self.redo)]:
             action = QAction(self)
             action.setShortcut(shortcut)
             action.triggered.connect(lambda checked=False, f=fn: self.safe(f) if not self.busy() else None)
             self.addAction(action)
-        self.setStyleSheet('QPushButton {padding:7px;} QGroupBox {margin-top:8px; padding-top:12px;} QLineEdit,QComboBox,QSpinBox {padding:4px;}')
+        self.setStyleSheet('QMainWindow {background:#f3f5f8;} QPushButton {padding:7px;} '
+            'QGroupBox {background:#ffffff;border:1px solid #d1d9e4;border-radius:6px;'
+            'margin-top:12px;padding-top:14px;font-weight:600;} '
+            'QGroupBox::title {subcontrol-origin:margin;left:12px;padding:0 4px;} '
+            'QLineEdit,QComboBox,QSpinBox {padding:4px;}')
 
     def busy(self):
         return self.worker is not None and self.worker.isRunning()
@@ -274,30 +284,90 @@ class Editor(QMainWindow):
         self.total.setText(f'/ {len(self.doc)} pages')
         self.render()
 
-    def render(self):
-        if not self.doc:
-            return
-        page = self.doc[self.page.value()-1]
-        # Limit the rendered bitmap for very large engineering pages.
-        scale = min(self.zoom.value(), 2600/max(page.rect.width, page.rect.height))
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
-        self.canvas.set_page(QPixmap.fromImage(image))
-        self.selection_changed(self.canvas.selection)
+    def about(self):
+        QMessageBox.about(self, 'About PDF Editor Tool',
+            '<h2>PDF Editor Tool</h2><p>Version: <b>1.0</b></p>'
+            '<p>Creator: <b>Midhun M</b></p>'
+            '<p>Crop, organize, annotate and redact PDFs locally.</p>')
 
-    def selection_changed(self, selection):
+    def view_comments(self):
+        self.require()
+        page = self.doc[self.page.value()-1]
+        notes=[]
+        for annot in page.annots() or []:
+            info=annot.info
+            if info.get('content'):
+                notes.append(f"{annot.type[1]} — {info.get('title') or 'Unknown author'}\n{info['content']}")
+        dialog=QDialog(self)
+        dialog.setWindowTitle(f'Comments — page {self.page.value()}')
+        dialog.resize(520,400)
+        layout=QVBoxLayout(dialog)
+        content=QTextEdit()
+        content.setReadOnly(True)
+        content.setPlainText('\n\n'.join(notes) or 'No comments on this page.')
+        layout.addWidget(content)
+        close=QPushButton('Close')
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def mode_changed(self, mode):
+        self.canvas.mode = mode
+        if mode in ('Text','Highlight','Comment'):
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(['Text','Highlight','Comment'].index(mode))
+            self.tabs.blockSignals(False)
+        self.canvas.update()
+        self.preview_timer.start()
+
+    def activate_overlay(self, mode):
+        self.mode.setCurrentText(mode)
+        self.preview_timer.start()
+
+    def overlay_options(self, operation):
+        if operation == 'text':
+            return dict(text=self.text.toPlainText(),size=self.font_size.value(),autofit=self.autofit.isChecked())
+        if operation == 'highlight':
+            return dict(color=self.highlight_color.currentData(),note=self.highlight_note.toPlainText(),
+                        area_highlight=self.highlight_area.isChecked())
+        return dict(note=self.comment.toPlainText(),color=(1,.84,0))
+
+    def render(self):
+        if not self.doc or self.busy():
+            return
+        index = self.page.value()-1
+        page = self.doc[index]
+        scale = min(self.zoom.value(),2600/max(page.rect.width,page.rect.height))
+        operation = self.mode.currentText().lower()
+        self.overlay_status.setText('')
+        if self.canvas.selection and operation in ('text','highlight','comment'):
+            # The live overlay is a disposable PDF page. Original content is never changed by preview.
+            with fitz.open() as preview:
+                preview.insert_pdf(self.doc,from_page=index,to_page=index)
+                try:
+                    message = apply_overlay(preview[0],operation,self.canvas.selection,index+1,len(self.doc),
+                                            **self.overlay_options(operation))
+                    self.overlay_status.setText(message + ' · not applied yet')
+                except ValueError as exc:
+                    self.overlay_status.setText(str(exc))
+                page = preview.reload_page(preview[0])
+                self.canvas.set_page(page_pixmap(page,scale))
+        else:
+            self.canvas.set_page(page_pixmap(page,scale))
+        self.update_measure()
+
+    def update_measure(self):
+        selection = self.canvas.selection
         if not selection or not self.doc:
             self.measure.setText('No area selected')
-            self.preview.setPixmap(QPixmap())
-            self.preview.setText('Live crop preview')
             return
         x0,y0,x1,y1 = selection
         page = self.doc[self.page.value()-1]
         self.measure.setText(f'Box: {(x1-x0)*page.rect.width:.1f} × {(y1-y0)*page.rect.height:.1f} pt')
-        pix = self.canvas.pix
-        cut = pix.copy(int(x0*pix.width()), int(y0*pix.height()),
-                       max(1,int((x1-x0)*pix.width())), max(1,int((y1-y0)*pix.height())))
-        self.preview.setPixmap(cut.scaled(280,135,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+
+    def selection_changed(self, selection):
+        self.update_measure()
+        self.preview_timer.start()
 
     def clear_selection(self):
         self.canvas.selection = None
@@ -313,6 +383,7 @@ class Editor(QMainWindow):
         return pages_from_text(self.ranges.text(), len(self.doc))
 
     def run_job(self, label, fn, callback):
+        self.preview_timer.stop()
         self.centralWidget().setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setRange(0,0)
@@ -331,7 +402,11 @@ class Editor(QMainWindow):
     def job_finished(self):
         self.centralWidget().setEnabled(True)
         self.progress.setVisible(False)
+        self.render()
         self.statusBar().showMessage('Ready. Save a copy to keep your changes.')
+        if self.pending_save_prompt:
+            self.pending_save_prompt = False
+            QTimer.singleShot(0,lambda: self.safe(self.save_pdf))
 
     def commit(self, target):
         self.history.append(self.path)
@@ -341,9 +416,10 @@ class Editor(QMainWindow):
         # Disk-backed, capped undo history keeps large PDFs out of RAM.
         if len(self.history) > 10:
             Path(self.history.pop(0)).unlink(missing_ok=True)
-        self.load(target)
         self.clear_selection()
+        self.load(target)
         self.dirty = True
+        self.pending_save_prompt = True
 
     def mutate(self, operation, area=False, custom_indices=None, **options):
         indices = self.indices() if custom_indices is None else custom_indices
@@ -394,18 +470,28 @@ class Editor(QMainWindow):
         return path
 
     def save_pdf(self, password=''):
+        self.require()
+        dialog = SavePreviewDialog(self.doc,self.page.value()-1,self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        indices = list(dialog.output_indices)
         path = self.output_path()
         if not path:
             return
         source = self.path
+        complete = indices == list(range(len(self.doc)))
         def task(progress):
             with fitz.open(source) as doc:
-                atomic_save(doc, path, password)
+                if not complete:
+                    doc.select(indices)
+                atomic_save(doc,path,password)
             return path
         def done(result):
-            self.dirty = False
-            QMessageBox.information(self, 'Saved', f'Saved: {result}')
-        self.run_job('Saving compressed PDF copy…', task, done)
+            # A subset export does not save all remaining document edits.
+            if complete:
+                self.dirty = False
+            QMessageBox.information(self,'Saved',f'Saved {len(indices)} page(s): {result}')
+        self.run_job('Saving PDF copy…',task,done)
 
     def merge(self):
         self.require()
@@ -492,8 +578,10 @@ class Editor(QMainWindow):
             QMessageBox.information(self,'Operation in progress','Wait for the current operation to finish.')
             event.ignore()
         elif self.discard_ok():
+            self.preview_timer.stop()
             if self.doc:
                 self.doc.close()
+                self.doc = None
             self.temp.cleanup()
             event.accept()
         else:
@@ -501,7 +589,15 @@ class Editor(QMainWindow):
 
 
 if __name__ == '__main__':
+    # Give Windows a stable app identity instead of grouping this under python.exe.
+    if sys.platform == 'win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('MidhunM.PDFEditorTool.1.0')
     app = QApplication(sys.argv)
+    app.setApplicationName('PDF Editor Tool')
+    app.setApplicationVersion('1.0')
+    app.setOrganizationName('Midhun M')
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / 'assets' / 'app.ico')))
     app.setStyle('Fusion')
     window = Editor()
     window.show()

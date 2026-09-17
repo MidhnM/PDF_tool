@@ -16,6 +16,7 @@ class GUI(unittest.TestCase):
 
     def test_selection_preview_worker_and_undo(self):
         w=Editor()
+        w.save_pdf=lambda: None
         path=w.fresh()
         with fitz.open() as d:
             for n in range(3):
@@ -28,7 +29,7 @@ class GUI(unittest.TestCase):
         QTest.mousePress(w.canvas,Qt.LeftButton,pos=QPoint(40,50))
         QTest.mouseMove(w.canvas,QPoint(360,450))
         self.assertIsNotNone(w.canvas.selection)
-        self.assertFalse(w.preview.pixmap().isNull())
+        self.assertFalse(w.canvas.pix.isNull())
         QTest.mouseRelease(w.canvas,Qt.LeftButton,pos=QPoint(360,450))
         w.page.setValue(2)
         self.assertEqual(w.canvas.selection,(.1,.1,.9,.9))
